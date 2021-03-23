@@ -3,7 +3,7 @@ use std::{fmt, num, str};
 
 use structopt::StructOpt;
 
-#[derive(StructOpt)]
+#[derive(Debug, StructOpt)]
 pub(crate) struct Opt {
     /// The URL of the file to be downloaded
     #[structopt(long, short)]
@@ -22,6 +22,7 @@ pub(crate) struct Opt {
     pub(crate) threads: CPUs,
 }
 
+#[derive(Debug)]
 pub(crate) struct CPUs(usize);
 
 impl CPUs {
