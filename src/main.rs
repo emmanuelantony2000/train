@@ -1,83 +1,93 @@
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom};
 use std::sync::Arc;
+use std::thread;
 
-use anyhow::{anyhow, bail};
-use reqwest::{header, Client};
-use tokio::sync::{mpsc, Notify};
+use crossbeam::channel;
+use reqwest::{blocking, header};
+use structopt::StructOpt;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // let url = "https://desktop.docker.com/mac/stable/Docker.dmg";
-    // let url = "https://filesamples.com/samples/document/txt/sample1.txt";
-    let url = "https://mirrors.edge.kernel.org/archlinux/iso/2021.03.01/archlinux-bootstrap-2021.03.01-x86_64.tar.gz";
-    let chunk = 8 * 1024 * 1024;
+mod cli;
 
-    // let cpus = num_cpus::get();
-    let cpus = 8;
+use cli::Opt;
 
-    let notify = Arc::new(Notify::new());
-    let (tx, mut rx) = mpsc::channel(cpus);
+fn main() -> anyhow::Result<()> {
+    let opt = Opt::from_args();
+    let chunk = opt.chunk * 1024 * 1024;
 
-    let client = Client::new();
-    let response = client.get(url).send().await?;
+    let (spawn_tx, spawn_rx) = channel::bounded(0);
+    let (worker_tx, worker_rx) = channel::bounded(opt.threads.cpus());
+    let size = blocking::get(&opt.url)?.content_length();
 
-    let size = response.content_length();
-
-    // let filename = response
-    //     .headers()
-    //     .get(header::CONTENT_DISPOSITION)
-    //     .ok_or(anyhow!("Error while accessing header"))?
-    //     .to_str()?;
-    // let filename = if filename.starts_with("attachment") {
-    //     let filename = filename.trim_start_matches("attachment; filename=");
-    //     filename.trim_matches('\"')
-    // } else {
-    //     bail!("Not a downloadable file");
-    // };
-
-    let file = File::create("arch.tar.gz")?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(File::create(opt.output)?);
 
     if let Some(size) = size {
         let size = size as usize;
+        let url = Arc::new(opt.url);
 
-        for (notify, tx, mut x, y) in (0..size)
-            .step_by(chunk)
-            .map(|x| (x, if x + chunk > size { size } else { x + chunk } - 1))
-            .map(|(x, y)| (notify.clone(), tx.clone(), x, y))
-        {
-            tokio::spawn(async move {
-                let client = Client::new();
-                notify.notified().await;
-                let mut res = client
-                    .get(url)
-                    .header(header::RANGE, format!("bytes={}-{}", x, y))
-                    .send()
-                    .await
-                    .unwrap();
+        thread::spawn(move || {
+            for (worker_tx, x, y) in (0..size)
+                .step_by(chunk)
+                .map(|x| (x, if x + chunk > size { size } else { x + chunk } - 1))
+                .map(|(x, y)| (worker_tx.clone(), x, y))
+            {
+                if spawn_rx.recv().is_ok() {
+                    let url = url.clone();
 
-                while let Some(bytes) = res.chunk().await.unwrap() {
-                    let len = bytes.len();
-                    tx.send((bytes, x)).await.unwrap();
-                    x += len;
+                    thread::spawn(move || {
+                        let client = blocking::Client::new();
+                        let res = client
+                            .get(&*url)
+                            .header(header::RANGE, format!("bytes={}-{}", x, y))
+                            .send()
+                            .unwrap();
+
+                        let length = (y - x + 1) as u64;
+
+                        worker_tx.send((res, x, length)).unwrap();
+                    });
+                } else {
+                    break;
                 }
-            });
+            }
+        });
+
+        for _ in 0..opt.threads.cpus() {
+            spawn_tx.send(());
         }
 
-        drop(tx);
-
-        for _ in 0..cpus {
-            notify.notify_one();
-        }
-
-        while let Some((bytes, x)) = rx.recv().await {
+        while let Ok((mut res, x, mut length)) = worker_rx.recv() {
             writer.seek(SeekFrom::Start(x as u64))?;
-            writer.write_all(&bytes)?;
 
-            notify.notify_one();
+            while length != 0 {
+                length -= res.copy_to(&mut writer)?;
+            }
+
+            spawn_tx.send(());
         }
     }
 
     Ok(())
 }
+
+// fn spawn_workers(rx: channel::Receiver<()>) {
+//     while rx.recv().is_ok() {
+//         worker();
+//     }
+// }
+
+// fn worker(url: impl AsRef<str>, mut x: usize, y: usize) {
+//     let client = blocking::Client::new();
+//     let mut res = client
+//         .get(url)
+//         .header(header::RANGE, format!("bytes={}-{}", x, y))
+//         .send()
+//         .await
+//         .unwrap();
+
+//     while let Some(bytes) = res.chunk().await.unwrap() {
+//         let len = bytes.len();
+//         tx.send((bytes, x)).await.unwrap();
+//         x += len;
+//     }
+// }
