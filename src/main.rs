@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
             .init(),
     }
 
-    let mut client = Client::new(opt)?;
+    let client = Client::new(opt)?;
     client.download()?;
 
     Ok(())

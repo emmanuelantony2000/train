@@ -25,6 +25,10 @@ pub enum TrainError {
     #[error("file write failed: {0}")]
     FileWriteError(io::Error),
 
+    /// Buffer write Error
+    #[error("buffer write failed: {0}")]
+    BufferWriteError(io::Error),
+
     /// File sync with filesystem Error
     #[error("file could not be synced with the filesystem")]
     FileSyncError(io::Error),
