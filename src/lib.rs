@@ -1,10 +1,10 @@
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Seek, SeekFrom};
 use std::sync::Arc;
+use std::{fs::File, io::Write};
 
 use crossbeam::channel;
 use threadpool::ThreadPool;
-use ureq::Agent;
+use ureq::{Agent, AgentBuilder};
 use url::Url;
 
 mod cli;
@@ -14,19 +14,21 @@ pub use cli::Opt;
 use error::TrainError;
 
 pub struct Client {
-    pub agent: Agent,
-    pub url: Arc<Url>,
-    pub size: Option<usize>,
-    pub chunk: usize,
-    pub threads: usize,
-    pub writer: File,
+    agent: Agent,
+    url: Arc<Url>,
+    size: Option<usize>,
+    chunk: usize,
+    threads: usize,
+    writer: File,
 }
 
 impl Client {
     pub fn new(opt: Opt) -> error::Result<Self> {
         let chunk = opt.chunk * 1024 * 1024;
         let threads = opt.threads.0;
-        let agent = Agent::new();
+        let agent = AgentBuilder::new()
+            .max_idle_connections_per_host(100)
+            .build();
 
         let response = agent.get(opt.url.as_ref()).call()?;
         let size = response
@@ -63,20 +65,21 @@ impl Client {
             let (worker_tx, worker_rx) = channel::unbounded();
 
             for (worker_tx, agent, url, x, y) in (0..size).step_by(self.chunk).map(|x| {
-                (
-                    worker_tx.clone(),
-                    self.agent.clone(),
-                    self.url.clone(),
-                    x,
-                    if x + self.chunk > size {
-                        size
-                    } else {
-                        x + self.chunk
-                    } - 1,
-                )
+                let worker_tx = worker_tx.clone();
+                let agent = self.agent.clone();
+                let url = self.url.clone();
+
+                let y = if x + self.chunk > size {
+                    size
+                } else {
+                    x + self.chunk
+                } - 1;
+
+                (worker_tx, agent, url, x, y)
             }) {
                 pool.execute(move || {
-                    let message = download_range(agent, url, x, y);
+                    let downloader = Downloader { agent, url, x, y };
+                    let message = download_range(downloader);
                     worker_tx.send(message).unwrap();
                 });
             }
@@ -84,11 +87,13 @@ impl Client {
             drop(worker_tx);
 
             while let Ok(message) = worker_rx.recv() {
-                let (mut reader, x) = message?;
+                let DownloadPart { x, buf } = message?;
                 self.writer
                     .seek(SeekFrom::Start(x as u64))
                     .map_err(TrainError::FileSeekError)?;
-                io::copy(&mut reader, &mut self.writer).map_err(TrainError::FileWriteError)?;
+                self.writer
+                    .write_all(&buf)
+                    .map_err(TrainError::FileWriteError)?;
             }
         }
 
@@ -98,18 +103,32 @@ impl Client {
     }
 }
 
-fn download_range(
+fn download_range(downloader: Downloader) -> error::Result<DownloadPart> {
+    let Downloader { agent, url, x, y } = downloader;
+
+    let capacity = y - x + 1;
+    let mut buf = Vec::with_capacity(capacity);
+
+    let mut reader = agent
+        .get(url.as_ref().as_ref())
+        .set("Range", format!("bytes={}-{}", x, y).as_ref())
+        .call()?
+        .into_reader();
+
+    io::copy(&mut reader, &mut buf).map_err(TrainError::FileWriteError)?;
+    let part = DownloadPart { x, buf };
+
+    Ok(part)
+}
+
+struct Downloader {
     agent: Agent,
     url: Arc<Url>,
     x: usize,
     y: usize,
-) -> error::Result<(impl Read + Send, usize)> {
-    Ok((
-        agent
-            .get(url.as_ref().as_ref())
-            .set("Range", format!("bytes={}-{}", x, y).as_ref())
-            .call()?
-            .into_reader(),
-        x,
-    ))
+}
+
+struct DownloadPart {
+    x: usize,
+    buf: Vec<u8>,
 }
